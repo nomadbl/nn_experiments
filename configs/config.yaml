@@ -1,1 +1,2 @@
-channels: 256
+channels: 512
+reg_coeff: 1
