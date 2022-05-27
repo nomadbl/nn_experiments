@@ -1,5 +1,3 @@
-import imp
-import os
 import torch
 import hydra
 import torchmetrics
@@ -45,7 +43,7 @@ class RegularizedMnistClassifier(pl.LightningModule):
     def __init__(self, classifier, cfg):
         super().__init__()
         self.classifier: nn.Module = classifier
-        self.lr = 0.0001
+        self.lr = cfg.lr
         self.regularizer = LipschitzRegularizer()
         self.train_accuracy = torchmetrics.Accuracy(num_classes=1)
         self.val_accuracy = torchmetrics.Accuracy(num_classes=1)
@@ -53,7 +51,7 @@ class RegularizedMnistClassifier(pl.LightningModule):
 
     def forward(self, inputs):
         return self.classifier(inputs)
-
+    
     def training_step(self, batch, batch_idx):
         inputs, labels = batch
         preds = self(inputs)
@@ -66,6 +64,13 @@ class RegularizedMnistClassifier(pl.LightningModule):
         self.log("accuracy", self.train_accuracy, prog_bar=True)
         return loss
     
+    def training_epoch_end(self, outputs):
+        tensorboard = self.logger.experiment
+        dataset = self.trainer.train_dataloader.dataset.datasets
+        tensorboard.add_figure("classifier", 
+                                classifier_plot(self, dataset),
+                                self.global_step)
+    
     def validation_step(self, batch, batch_idx):
         inputs, labels = batch
         preds: torch.Tensor = self(inputs)
@@ -75,7 +80,7 @@ class RegularizedMnistClassifier(pl.LightningModule):
         self.log("val accuracy", self.val_accuracy, prog_bar=True)
     
     def configure_optimizers(self):
-        return SGD(self.classifier.parameters(), self.lr)
+        return SGD(self.classifier.parameters(), self.lr, momentum=0.1)
 
 # class AlbumentationsDataset(Dataset):
 #     def __init__(self, dataset, transform=None):
@@ -100,27 +105,39 @@ def myapp(cfg: DictConfig):
     transform = None
     # train_dataset = MNIST(os.path.expanduser("~/datasets/MNIST"), train=True, download=True, transform=ToTensor())
     # val_dataset = MNIST(os.path.expanduser("~/datasets/MNIST"), train=False, download=True, transform=ToTensor())
-    train_dataset = Spiral()
-    val_dataset = Spiral()
+    train_dataset = Spiral(1000)
+    val_dataset = train_dataset
     # classifier = nn.Sequential(
-    #                         nn.Conv2d(1, cfg.channels, (3,3)),
+    #                         nn.Conv2d(1, cfg.channels, (3,3)), nn.ReLU(),
     #                         nn.Flatten(),
     #                         nn.LazyLinear(10)
     #                         )
-    regressor = nn.Sequential(
-                            nn.Linear(2, cfg.channels),
-                            nn.Linear(cfg.channels, cfg.channels),
-                            nn.Linear(cfg.channels, 2),
-                            nn.Linear(2, 1),
-                            )
+    layers = [nn.Linear(2, cfg.channels), nn.ReLU()]
+    for _ in range(cfg.layers-2):
+        layers.extend([nn.Linear(cfg.channels, cfg.channels), nn.ReLU(), nn.BatchNorm1d(cfg.channels)])
+    layers.extend([nn.Linear(cfg.channels, 1, bias=False)])
+    regressor = nn.Sequential(*layers)
     # model = RegularizedMnistClassifier(classifier, cfg)
     model = RegularizedMnistClassifier(regressor, cfg)
-    trainer = pl.Trainer(logger=TensorBoardLogger("tb_logs"), enable_progress_bar=True, max_epochs=2)
-    train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=8)
-    val_loader = DataLoader(val_dataset, batch_size=16, num_workers=8)
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    
+    train_loader = DataLoader(train_dataset, batch_size=100, shuffle=True, num_workers=8)
+    val_loader = DataLoader(val_dataset, batch_size=100, num_workers=8)
 
-    classifier_plot(model, train_dataset)
+    # ##### optimize learning rate
+    # trainer = pl.Trainer(auto_lr_find=True)
+    # lr_finder = trainer.tuner.lr_find(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    # # Results can be found in
+    # lr_finder.results
+
+    # # Plot with
+    # fig = lr_finder.plot(suggest=True)
+    # plt.savefig("lr_find.png")
+    # plt.close()
+    # trainer.tune(model)
+    
+    ##### train
+    trainer = pl.Trainer(logger=TensorBoardLogger("tb_logs"), enable_progress_bar=True, max_epochs=10)
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
 
 if __name__ == "__main__":
     
