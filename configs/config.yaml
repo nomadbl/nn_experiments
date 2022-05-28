@@ -2,3 +2,5 @@ channels: 128
 layers: 10
 reg_coeff: 1
 lr: 0.01
+
+n_classes: 10

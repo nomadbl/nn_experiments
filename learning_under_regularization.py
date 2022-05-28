@@ -10,7 +10,6 @@ from torch.nn import functional as F
 from albumentations.pytorch import ToTensorV2
 
 from torchvision.datasets import MNIST
-from torchvision.transforms import ToTensor
 from omegaconf import OmegaConf, DictConfig
 from torch.utils.data import DataLoader, Dataset
 
@@ -82,23 +81,7 @@ class RegularizedMnistClassifier(pl.LightningModule):
     def configure_optimizers(self):
         return SGD(self.classifier.parameters(), self.lr, momentum=0.1)
 
-# class AlbumentationsDataset(Dataset):
-#     def __init__(self, dataset, transform=None):
-#         super().__init__()
-#         self.dataset = dataset
-#         self.transform = transform
-    
-#     def __len__(self):
-#         return len(self.dataset)
-    
-#     def __getitem__(self, index):
-#         item = self.dataset[index]
-#         image, label = item
-#         image = ToTensor()(image)
-#         if self.transform:
-#             transformed = self.transform(image=image)
-#             image = transformed["image"]
-#         return image, label
+
 
 @hydra.main(config_path="configs", config_name="config")
 def myapp(cfg: DictConfig):

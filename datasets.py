@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from numpy import pi
 from torch.utils.data import Dataset
-import matplotlib.pyplot as plt
+from torchvision.transforms import ToTensor
 
 class Spiral(Dataset):
     def __init__(self, length=400) -> None:
@@ -30,6 +30,40 @@ class Spiral(Dataset):
     def __getitem__(self, index):
         return self.res[index,:2], self.res[index, 2].unsqueeze(0)
 
-# plt.scatter(x_a[:,0],x_a[:,1])
-# plt.scatter(x_b[:,0],x_b[:,1])
-# plt.show()
+class Circles(Dataset):
+    def __init__(self, n_circles=2, length=400) -> None:
+        super().__init__()
+        self.N = length
+        self.n_circles = n_circles
+        pi_t = torch.tensor(pi)
+        self.theta = torch.sqrt(torch.rand(self.N))*2*pi_t # np.linspace(0,2*pi,100)
+
+        rs = torch.linspace(1, 1 * self.n_circles, self.n_circles)
+        datas = [torch.vstack([torch.cos(self.theta)*rs[i], torch.sin(self.theta)*rs[i]]).T for i in range(self.n_circles)]
+        xs = [datas[i] + torch.randn(self.N,2) for i in range(self.n_circles)]
+        xs_and_labels = [torch.cat((xs[i], i * torch.ones((self.N,1))), dim=1) for i in range(self.n_circles)]
+        self.dataset_tensor = torch.cat(xs_and_labels, dim=0)
+    
+    def __len__(self):
+        return self.dataset_tensor.shape[0]
+
+    def __getitem__(self, index):
+        return self.dataset_tensor[index,:2], self.dataset_tensor[index, 2].unsqueeze(0)
+
+class AlbumentationsDataset(Dataset):
+    def __init__(self, dataset, transform=None):
+        super().__init__()
+        self.dataset = dataset
+        self.transform = transform
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, index):
+        item = self.dataset[index]
+        image, label = item
+        image = ToTensor()(image)
+        if self.transform:
+            transformed = self.transform(image=image)
+            image = transformed["image"]
+        return image, label
