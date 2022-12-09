@@ -20,7 +20,7 @@
 # in the presence of stochastic noise calculating an approximate second derivative will give noise of variance sqrt(2) * \sigma_s / dw
 # f'' (in practive) ~ N(f'', sqrt(2) * \sigma_s / sqrt(B) / \alpha)
 # the absolute value of the second derivative can be approximated using the EMA of (<f'>-f')^2 divided by \alpha^2 step size
-# then in the mean,      E[(<f'>-f')^2 / \alpha^2] ~= K^2
+# then in the mean,  E[(<f'>_t - f'_(t+1))^2 / \alpha^2] = E[(<f'>- /mu_t + /mu_t - f'_(t+1))^2 / \alpha^2] ~= d\mu^2 / \alpha^2 + K^2 ~ \sigma_s^2 / \alpha^2 + K^2
 # with a variance of:    2 * \sigma_s^2 / B / \alpha^2
 # The probability of having 
 # || E[(<f'>-f')^2 / \alpha^2] ||< 2*sqrt(2) * 2 * \sigma_s^2 / B / \alpha^2
@@ -67,6 +67,8 @@ def sag(params: List[Tensor],
         ema_s_vars: List[Tensor],
         ema_avgs: List[Tensor],
         ema_vars: List[Tensor],
+        curvatures: List[Tensor],
+        adaptation_factors: List[Tensor],
         state_steps: List[int],
         *,
         beta1: float,
@@ -86,12 +88,16 @@ def sag(params: List[Tensor],
         ema_avg = ema_avgs[i]
         ema_var = ema_vars[i]
         ema_s_var = ema_s_vars[i]
+        curvature = curvatures[i]
+        adaptation_factor = adaptation_factors[i]
+        
         step = state_steps[i]
-        grad_diff = grad.sub(ema_avg)
-        grad_s_diff = grad.sub(grad_prev)
-
         bias_correction1 = 1 - beta1 ** step
         bias_correction2 = 1 - beta2 ** step
+        
+        grad_s_diff = grad.sub(grad_prev)
+        ema_s_var.mul_(beta2).addcmul_(grad_s_diff, grad_s_diff.conj(), value=1 - beta2)
+        ema_s_var.div_(bias_correction2)
 
         if weight_decay != 0:
             grad = grad.add(param, alpha=weight_decay)
@@ -99,21 +105,23 @@ def sag(params: List[Tensor],
         # mean and variance running averages
         ema_avg.mul_(beta1).add_(grad, alpha=1 - beta1).div_(bias_correction1)
         # estimate stochastic noise
+        grad_diff = grad.sub(ema_avg)
         ema_var.mul_(beta2).addcmul_(grad_diff, grad_diff.conj(), value=1 - beta2)
-        ema_s_var.mul_(beta2).addcmul_(grad_s_diff, grad_s_diff.conj(), value=1 - beta2)
         ema_var.div_(bias_correction2)
-        ema_s_var.div_(bias_correction2)
+        
 
         # estimate curvature
         step_size = lr * tau
-        k = ema_var.sqrt() / step_size
-        p = erf_approx(k / (2 * ema_s_var.sqrt())) # probability that -2 * ema_s_var < <k> - k < 2 * ema_s_var
-        l = torch.exp(-k/step_size)
-        k_eff = (k * (1-l)+ step_size * l) # >= k
+        # K = [ema_var - ema_s_var].sqrt() / step_size
+        torch.div(ema_var.sub(ema_s_var).relu().sqrt(), step_size, out=curvature)
+        p = erf_approx(curvature / (2 * ema_s_var.sqrt())) # probability that -2 * ema_s_var < <k> - k < 2 * ema_s_var
+        l = torch.exp(-curvature/step_size)
+        k_eff = (curvature * (1-l)+ step_size * l) # >= k
 
-        snr = ema_avg.abs().div(100 * ema_s_var.sqrt())
+        snr = ema_avg.abs().div(ema_s_var.sqrt())
         noise_factor = torch.tanh(snr / tau)
         curvature_factor = (step_size * (1-p) + k_eff * p)
+        torch.div(noise_factor, curvature_factor, out=adaptation_factor)
         param.addcdiv_(ema_avg * noise_factor, curvature_factor, value=-step_size)
         # param.addcmul_(ema_avg * noise_factor, curvature_factor, value=-step_size)
 
@@ -177,6 +185,8 @@ class SAG(Optimizer):
             ema_avgs = []
             ema_s_vars = []
             ema_vars = []
+            curvature = []
+            adaptation_factor = []
             state_steps = []
             beta1, beta2 = group['betas']
 
@@ -199,9 +209,13 @@ class SAG(Optimizer):
                     # Exponential moving average of gradient variance values
                     state['ema_var'] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     state['ema_s_var'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['curvature'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['adaptation_factor'] = torch.zeros_like(p, memory_format=torch.preserve_format)
                 ema_avgs.append(state['ema_avg'])
                 ema_vars.append(state['ema_var'])
                 ema_s_vars.append(state['ema_s_var'])
+                curvature.append(state['curvature'])
+                adaptation_factor.append(state['adaptation_factor'])
                 # update the steps for each param group update
                 state['step'] += 1
                 # record the step after step update
@@ -213,6 +227,8 @@ class SAG(Optimizer):
                    ema_s_vars,
                    ema_avgs,
                    ema_vars,
+                   curvature,
+                   adaptation_factor,
                    state_steps,
                    beta1=beta1,
                    beta2=beta2,

@@ -2,6 +2,7 @@ import os
 
 import torch
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torch.nn import functional as F
 from torchmetrics import Accuracy
 import pytorch_lightning as pl
@@ -15,11 +16,12 @@ from corrected_adam import CorrectedAdam
 from SAG_optimizer import SAG
 
 class MnistClassifier(pl.LightningModule):
-    def __init__(self) -> None:
+    def __init__(self, optimizer_debug_logs=False) -> None:
         super().__init__()
         self.accuracy = Accuracy(num_classes=10)
         self.loss = torch.nn.CrossEntropyLoss()
         self.lr = 0.001
+        self.optimizer_debug_logs = optimizer_debug_logs
 
         def block(in_dim, out_dim, stride=1):
             conv = torch.nn.Conv2d(in_dim, out_dim, 3, stride, 1)
@@ -72,7 +74,7 @@ class MnistClassifier(pl.LightningModule):
 
     def configure_optimizers(self):
         # return CorrectedAdam(self.model.parameters(), self.lr, (0.9, 0.3), eps=0.1)
-        return SAG(self.model.parameters(), 64, self.lr, (0.9, 0.9), tau=3)
+        return SAG(self.model.parameters(), 64, self.lr, (0.3, 0.9), tau=3)
 
     def forward(self, inputs):
         return self.model(inputs)
@@ -84,11 +86,36 @@ class MnistClassifier(pl.LightningModule):
         #         print(f"{name}.grad = {param.grad.norm()}")
         ...
     
+    def log_optimizer_params(self):
+        if not self.optimizer_debug_logs:
+            return
+        optimizer = self.optimizers(False)
+        param_groups = optimizer.param_groups
+        logger: TensorBoardLogger = self.logger
+        writer: SummaryWriter = logger.experiment
+        for group in param_groups:
+            for p in group:
+                p: torch.nn.parameter.Parameter
+                for idx, p in enumerate(optimizer.state):
+                    state = optimizer.state[p]
+                    ema_avg = state['ema_avg']
+                    ema_var = state['ema_var']
+                    ema_s_var = state['ema_s_var']
+                    curvature = state['curvature']
+                    adaptation_factor = state['adaptation_factor']
+                    writer.add_histogram(f"ema_avg/{idx}", ema_avg, self.global_step)
+                    writer.add_histogram(f"ema_var/{idx}", ema_var, self.global_step)
+                    writer.add_histogram(f"ema_s_var/{idx}", ema_s_var, self.global_step)
+                    writer.add_histogram(f"curvature/{idx}", curvature, self.global_step)
+                    writer.add_histogram(f"adaptation_factor/{idx}", adaptation_factor, self.global_step)
+
     def training_step(self, batch, batch_idx):
         x, label = batch
         y = self(x)
         loss = F.cross_entropy(y, label)
         self.log("train/loss", loss)
+        
+        self.log_optimizer_params()
         return loss
     
     def validation_step(self, batch, batch_idx):
