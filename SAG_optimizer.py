@@ -92,9 +92,13 @@ def sag(params: List[Tensor],
         adaptation_factor = adaptation_factors[i]
         
         step = state_steps[i]
+        ## TODO: Test the idea that the bigger the ema_avg the faster the vars should change
+        # beta2 = 2*(torch.sigmoid(ema_avg.abs() / ema_var.sqrt()) -1/2)
+        #
         bias_correction1 = 1 - beta1 ** step
         bias_correction2 = 1 - beta2 ** step
-        
+
+        # estimate stochastic noise
         grad_s_diff = grad.sub(grad_prev)
         ema_s_var.mul_(beta2).addcmul_(grad_s_diff, grad_s_diff.conj(), value=1 - beta2)
         ema_s_var.div_(bias_correction2)
@@ -104,13 +108,11 @@ def sag(params: List[Tensor],
 
         # mean and variance running averages
         ema_avg.mul_(beta1).add_(grad, alpha=1 - beta1).div_(bias_correction1)
-        # estimate stochastic noise
+        # estimate curvature
         grad_diff = grad.sub(ema_avg)
         ema_var.mul_(beta2).addcmul_(grad_diff, grad_diff.conj(), value=1 - beta2)
         ema_var.div_(bias_correction2)
         
-
-        # estimate curvature
         step_size = lr * tau
         # K = [ema_var - ema_s_var].sqrt() / step_size
         torch.div(ema_var.sub(ema_s_var).relu().sqrt(), step_size, out=curvature)
@@ -122,7 +124,8 @@ def sag(params: List[Tensor],
         noise_factor = torch.tanh(snr / tau)
         curvature_factor = (step_size * (1-p) + k_eff * p)
         torch.div(noise_factor, curvature_factor, out=adaptation_factor)
-        param.addcdiv_(ema_avg * noise_factor, curvature_factor, value=-step_size)
+        # param.addcdiv_(ema_avg * noise_factor, curvature_factor, value=-step_size) # TODO: this version works but is slow
+        param.addcmul_(ema_avg * noise_factor, curvature_factor, value=-1)
         # param.addcmul_(ema_avg * noise_factor, curvature_factor, value=-step_size)
 
 class SAG(Optimizer):
