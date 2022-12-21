@@ -14,27 +14,32 @@ from torchvision.transforms import Resize, Compose, ToTensor, Normalize
 from self_normalizing_nn import self_normalizing_nn_init
 
 from corrected_adam import CorrectedAdam
-from SAG_optimizer import SAG
+from SAG_optimizer import SAG, SAG_NoCurvature
 
 class MnistClassifier(pl.LightningModule):
-    def __init__(self, model: str ,optimizer_debug_logs=False, sgd=False) -> None:
+    def __init__(self, model: str ,optimizer_debug_logs=False, sgd=False, no_curvature=False) -> None:
         super().__init__()
         self.accuracy = Accuracy(num_classes=10)
         self.loss = torch.nn.CrossEntropyLoss()
         self.lr = 0.001
         self.optimizer_debug_logs = optimizer_debug_logs
         self.sgd = sgd
+        self.no_curvature = no_curvature
 
         if model == "cnn_small":
             # for digits mnist
+            self_normalizing = True
             def block(in_dim, out_dim, stride=1):
                 conv = torch.nn.Conv2d(in_dim, out_dim, 3, stride, 1)
-                torch.nn.init.xavier_uniform_(conv.weight, gain=torch.nn.init.calculate_gain("relu"))
-                torch.nn.init.zeros_(conv.bias)
-                # self_normalizing_nn_init(conv)
+                if self_normalizing:
+                    self_normalizing_nn_init(conv)
+                else:
+                    torch.nn.init.xavier_uniform_(conv.weight, gain=torch.nn.init.calculate_gain("relu"))
+                    torch.nn.init.zeros_(conv.bias)
                 return torch.nn.Sequential(conv, 
-                                           torch.nn.BatchNorm2d(out_dim), 
-                                           torch.nn.ReLU())
+                                           torch.nn.Identity() if self_normalizing else torch.nn.BatchNorm2d(out_dim), 
+                                           torch.nn.SELU() if self_normalizing else torch.nn.ReLU())
+
             layers = [(1, 16, 1), (16, 16, 1), (16, 32, 2), (32, 32, 2), (32, 64, 2)]
             middle = torch.nn.Sequential(*[block(_id, _od, s) for _id, _od, s in layers])
             end = torch.nn.Sequential(torch.nn.AdaptiveAvgPool2d((1,1)),
@@ -47,15 +52,15 @@ class MnistClassifier(pl.LightningModule):
         elif model == "fc":
             # for digits mnist
             def fclayer(*args, **kwargs):
-                l = torch.nn.LazyLinear(**kwargs)
+                l = torch.nn.Linear(**kwargs)
                 torch.nn.init.xavier_uniform_(l.weight, gain=torch.nn.init.calculate_gain("relu"))
-                if l.bias:
+                if l.bias is not None:
                     torch.nn.init.zeros_(l.bias)
                 return l
             self.model = torch.nn.Sequential(torch.nn.Flatten(), 
-                                             fclayer(out_features=500), 
-                                             fclayer(out_features=300),
-                                             fclayer(out_features=10, bias=False))
+                                             fclayer(in_features=32**2, out_features=500), torch.nn.ReLU(),
+                                             fclayer(in_features=500, out_features=300), torch.nn.ReLU(),
+                                             fclayer(in_features=300, out_features=10, bias=False))
             
         # self_normalizing_nn_init(end[2])
         
@@ -91,7 +96,9 @@ class MnistClassifier(pl.LightningModule):
         # return CorrectedAdam(self.model.parameters(), self.lr, (0.9, 0.3), eps=0.1)
         if self.sgd:
             return SGD(self.model.parameters(), self.lr, 0.9, weight_decay=0.0001)
-        return SAG(self.model.parameters(), 64, self.lr, (0.3, 0.9), tau=3)
+        if self.no_curvature:
+            return SAG_NoCurvature(self.model.parameters(), self.lr, (0.3, 0.5), tau=3)
+        return SAG(self.model.parameters(), self.lr, (0.3, 0.9), tau=3)
 
     def forward(self, inputs):
         return self.model(inputs)
@@ -162,11 +169,16 @@ def get_dataloaders(dtst):
     val_loader = DataLoader(val_dataset, 64, False, num_workers=2)
     return train_loader, val_loader
 
-def train(dtst: str, model: str, optimizer_debug_logs=False, ckpt: str=None, sgd=False):
+def train(dtst: str, model: str, optimizer_debug_logs=False, ckpt: str=None, sgd=False, no_curvature=False):
     train_loader, val_loader = get_dataloaders(dtst)
-    optim_name = "" if sgd else "_sag"
+    if no_curvature:
+        optim_name = "_sag_nc"
+    elif sgd:
+        optim_name = ""
+    else:
+        optim_name = "_sag"
     name = f"{model}_{dtst}{optim_name}"
-    model = MnistClassifier(model, optimizer_debug_logs=optimizer_debug_logs)
+    model = MnistClassifier(model, optimizer_debug_logs=optimizer_debug_logs, sgd=sgd, no_curvature=no_curvature)
     trainer = pl.Trainer(logger=TensorBoardLogger(name),
                          max_epochs=300)
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=ckpt)
@@ -178,7 +190,9 @@ if __name__ == "__main__":
     # ckpt = "/home/lior/experiments/mnist/lightning_logs/version_0/checkpoints/epoch=36-step=34706.ckpt"
     dtst = "mnist"
     model = "cnn_small"
+    # model = "fc"
     ckpt=None
     optimizer_debug_logs = False
-    sgd = True
-    train(dtst, model, optimizer_debug_logs, ckpt, sgd)
+    sgd = False
+    no_curvature = True
+    train(dtst, model, optimizer_debug_logs, ckpt, sgd, no_curvature)
