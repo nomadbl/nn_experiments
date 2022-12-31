@@ -1,4 +1,6 @@
 import os
+from typing import Tuple, Dict, List
+from collections import defaultdict
 
 import torch
 from torch.utils.data import DataLoader
@@ -17,7 +19,7 @@ from corrected_adam import CorrectedAdam
 from SAG_optimizer import SAG, SAG_NoCurvature
 
 class MnistClassifier(pl.LightningModule):
-    def __init__(self, model: str ,optimizer_debug_logs=False, sgd=False, no_curvature=False) -> None:
+    def __init__(self, model: str ,optimizer_debug_logs:bool=False, sgd=False, no_curvature=False) -> None:
         super().__init__()
         self.accuracy = Accuracy(num_classes=10)
         self.loss = torch.nn.CrossEntropyLoss()
@@ -110,36 +112,32 @@ class MnistClassifier(pl.LightningModule):
         #         print(f"{name}.grad = {param.grad.norm()}")
         ...
     
-    def log_optimizer_params(self):
-        if not self.optimizer_debug_logs:
+    def log_optimizer_params(self, optimizer_debug_logs):
+        if not optimizer_debug_logs:
             return
         optimizer = self.optimizers(False)
         param_groups = optimizer.param_groups
         logger: TensorBoardLogger = self.logger
         writer: SummaryWriter = logger.experiment
+        hists: defaultdict[str, List[torch.Tensor]] = defaultdict(list)
         for group in param_groups:
             for p in group:
                 p: torch.nn.parameter.Parameter
-                for idx, p in enumerate(optimizer.state):
-                    state = optimizer.state[p]
-                    ema_avg = state['ema_avg']
-                    ema_var = state['ema_var']
-                    ema_s_var = state['ema_s_var']
-                    curvature = state['curvature']
-                    adaptation_factor = state['adaptation_factor']
-                    writer.add_histogram(f"ema_avg/{idx}", ema_avg, self.global_step)
-                    writer.add_histogram(f"ema_var/{idx}", ema_var, self.global_step)
-                    writer.add_histogram(f"ema_s_var/{idx}", ema_s_var, self.global_step)
-                    writer.add_histogram(f"curvature/{idx}", curvature, self.global_step)
-                    writer.add_histogram(f"adaptation_factor/{idx}", adaptation_factor, self.global_step)
+                for p in optimizer.state.keys():
+                    state: Dict[str, torch.Tensor] = optimizer.state[p]
+                    for state_str, val in state.items():
+                        if not isinstance(val, torch.Tensor):
+                            continue
+                        hists[state_str].append(val.flatten())
+        for state_str, hist in hists.items():
+            writer.add_histogram(state_str, torch.cat(hist), self.global_step, bins='auto')
 
     def training_step(self, batch, batch_idx):
         x, label = batch
         y = self(x)
         loss = F.cross_entropy(y, label)
         self.log("train/loss", loss)
-        
-        self.log_optimizer_params()
+        self.log_optimizer_params(self.trainer.is_last_batch and self.optimizer_debug_logs)
         return loss
     
     def validation_step(self, batch, batch_idx):
@@ -179,7 +177,7 @@ def train(dtst: str, model: str, optimizer_debug_logs=False, ckpt: str=None, sgd
         optim_name = "_sag"
     name = f"{model}_{dtst}{optim_name}"
     model = MnistClassifier(model, optimizer_debug_logs=optimizer_debug_logs, sgd=sgd, no_curvature=no_curvature)
-    trainer = pl.Trainer(logger=TensorBoardLogger(name),
+    trainer = pl.Trainer(logger=TensorBoardLogger(os.path.join("outputs", name)),
                          max_epochs=300)
     trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=ckpt)
 
@@ -192,7 +190,8 @@ if __name__ == "__main__":
     model = "cnn_small"
     # model = "fc"
     ckpt=None
-    optimizer_debug_logs = False
+    # optimizer_debug_logs = ('ema_avg', 'ema_var', 'ema_s_var', 'curvature', 'adaptation_factor')
+    optimizer_debug_logs = True
     sgd = False
     no_curvature = True
     train(dtst, model, optimizer_debug_logs, ckpt, sgd, no_curvature)

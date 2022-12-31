@@ -48,6 +48,7 @@
 
 import math
 import torch
+from torch.nn import functional as F
 from torch.optim import Optimizer
 from torch import Tensor
 from typing import List, Optional
@@ -60,14 +61,11 @@ def erf_approx(x: torch.Tensor):
     """
     return torch.tanh(math.sqrt(math.pi) * math.log(2) * x)
 
-# def smoothstep(edge0: float, edge1: float, x: torch.Tensor):
-#    x = torch.clamp(x, edge0, edge1)
-#    if (x < edge0)
-#       return 0
-#    if (x >= edge1)
-#       return 1
-#    x = (x - edge0) / (edge1 - edge0)
-#    return x * x * (3 - 2 * x)
+def smoothstep(x: torch.Tensor, edge0: float, edge1: float):
+   # convert [edge0,edge1] to [-1,1] range
+   x = (x-edge0)/(edge1-edge0) # [0, 1]
+   x = torch.clamp(x, 0, 1)
+   return x * x * (3 - 2 * x) # apply hermite interpolation in middle region.
 
 
 def sag(params: List[Tensor],
@@ -145,8 +143,8 @@ def sag_no_curvature(params: List[Tensor],
         ema_avgs: List[Tensor],
         state_steps: List[int],
         *,
-        beta1: float,
-        beta2: float,
+        beta_min: float,
+        beta_max: float,
         lr: float,
         weight_decay: float,
         tau: float,
@@ -162,24 +160,28 @@ def sag_no_curvature(params: List[Tensor],
         ema_s_var = ema_s_vars[i]
         
         step = state_steps[i]
-        bias_correction1 = 1 - beta1 ** step
-        bias_correction2 = 1 - beta2 ** step
-
-        # estimate stochastic noise
+        
+        # estimate stochastic noise. inspired by KAMA https://school.stockcharts.com/doku.php?id=technical_indicators:kaufman_s_adaptive_moving_average
         grad_s_diff = grad.sub(grad_prev)
-        ema_s_var.mul_(beta2).addcmul_(grad_s_diff, grad_s_diff.conj(), value=1 - beta2).div_(bias_correction2)
+        
+        bias_correction2 = 1 - beta_max ** step
+        ema_s_var.mul_(beta_max).addcmul_(grad_s_diff, grad_s_diff.conj(), value=1 - beta_max).div_(bias_correction2)
 
-        if weight_decay != 0:
-            grad = grad.add(param, alpha=weight_decay)
+        # if weight_decay != 0:
+            # grad = grad.add(param, alpha=weight_decay)
 
         # mean and variance running averages
-        ema_avg.mul_(beta1).add_(grad, alpha=1 - beta1).div_(bias_correction1)
+        volatility_ratio = torch.clamp(torch.sub(grad, ema_avg).abs().div(ema_s_var.sqrt() / (1-beta_max)+1e-16), 0, 1) # change / volatility
+        beta_eff = (volatility_ratio*(beta_max-beta_min)+beta_min) # change var faster if incoming value is big
+        bias_correction = 1 - beta_eff ** step
+        ema_avg.mul_(beta_eff).add_(grad*(1 - beta_eff)).div_(bias_correction)
         
         step_size = lr
 
-        snr = ema_avg.abs().div(ema_s_var.sqrt()+1e-16)
-        noise_factor = 100*torch.tanh(snr / tau)
-        torch.s
+        # snr = ema_avg.abs().div(ema_s_var.sqrt()+1e-16)
+        # noise_factor = smoothstep(snr, 3, 4) # snr needs to be at least 3
+
+        noise_factor = 1-smoothstep(volatility_ratio, 0.5, 0.6) # step in the direction if it is not changing rapidly now
         # if torch.isnan(adaptation_factor).any():
         #     print("detected nans")
         param.addcmul_(ema_avg, noise_factor, value=-step_size)
@@ -354,10 +356,11 @@ class SAG_NoCurvature(Optimizer):
             return loss
 
         for group_idx, group in enumerate(self.param_groups):
+            state_keys = []
             params_with_grad = []
-            grads = []
-            ema_avgs = []
-            ema_s_vars = []
+            grads: List[torch.Tensor] = []
+            ema_avgs: List[torch.Tensor] = []
+            ema_s_vars: List[torch.Tensor] = []
             state_steps = []
             beta1, beta2 = group['betas']
 
@@ -372,6 +375,7 @@ class SAG_NoCurvature(Optimizer):
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                 grads.append(p.grad)
                 state = self.state[p]
+                state_keys.append(p)
                 # Lazy state initialization
                 if len(state) == 0:
                     state['step'] = 0
@@ -379,7 +383,7 @@ class SAG_NoCurvature(Optimizer):
                     state['ema_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
                     # Exponential moving average of gradient variance values
                     # state['ema_s_var'] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state['ema_s_var'] = 20 * torch.ones_like(p, memory_format=torch.preserve_format)
+                    state['ema_s_var'] = 0 * torch.ones_like(p, memory_format=torch.preserve_format)
                 ema_avgs.append(state['ema_avg'])
                 ema_s_vars.append(state['ema_s_var'])
                 # update the steps for each param group update
@@ -393,12 +397,17 @@ class SAG_NoCurvature(Optimizer):
                    ema_s_vars,
                    ema_avgs,
                    state_steps,
-                   beta1=beta1,
-                   beta2=beta2,
+                   beta_min=beta1,
+                   beta_max=beta2,
                    lr=group['lr'],
                    weight_decay=group['weight_decay'],
                    tau=group['tau'],
                    maximize=group['maximize'])
+            
+            # update auxilary state variables meant for debugging
+            for p, g, mu, sigma in zip(state_keys, grads, ema_avgs, ema_s_vars):
+                state = self.state[p]
+                state["residual"] = g-mu
 
         # clean up for next step
         self.prev_grads = None
